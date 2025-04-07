@@ -13,8 +13,6 @@ services:
         value: 10000
     autoDeploy: true
     healthCheckPath: /
-    domains:
-      - shl-assessment-api.onrender.com
     plan: starter # Specifies the free tier
     scaling:
       minInstances: 1
