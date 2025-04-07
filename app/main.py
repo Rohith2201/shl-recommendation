@@ -10,7 +10,6 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import pandas as pd
-import gc
 
 # Load environment variables
 load_dotenv()
@@ -29,7 +28,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
-    max_age=86400
+    max_age=86400  # 24 hours
 )
 
 # Initialize Gemini
@@ -37,24 +36,8 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Lazy loading for heavy models
-_encoder = None
-_assessment_embeddings = None
-_similarity_matrix = None
-
-def get_encoder():
-    global _encoder
-    if _encoder is None:
-        _encoder = SentenceTransformer('all-MiniLM-L6-v2')
-    return _encoder
-
-def get_assessment_embeddings():
-    global _assessment_embeddings
-    if _assessment_embeddings is None:
-        encoder = get_encoder()
-        texts = [f"{a['name']} {a['description']} {a['test_type']}" for a in ASSESSMENTS]
-        _assessment_embeddings = encoder.encode(texts, convert_to_numpy=True)
-    return _assessment_embeddings
+# Initialize sentence transformer
+encoder = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Load and prepare assessment data
 class Assessment(BaseModel):
@@ -628,67 +611,38 @@ ASSESSMENTS = [
     }
 ]
 
+# Create embeddings for assessments
+assessment_embeddings = encoder.encode([f"{a['name']} {a['description']} {a['test_type']}" for a in ASSESSMENTS])
+
 class RecommendationResponse(BaseModel):
     recommendations: List[Assessment]
     explanation: str
 
-def compute_similarities(query_embedding, assessment_embeddings):
-    # Reuse preallocated array for similarities
-    global _similarity_matrix
-    if _similarity_matrix is None:
-        _similarity_matrix = np.zeros((1, len(ASSESSMENTS)), dtype=np.float32)
-    
-    # Compute similarities in-place
-    np.dot(query_embedding, assessment_embeddings.T, out=_similarity_matrix)
-    return _similarity_matrix[0]
-
 def get_recommendations(query: str, max_results: int = 10) -> RecommendationResponse:
+    # Generate query embedding
+    query_embedding = encoder.encode([query])
+    
+    # Calculate similarities
+    similarities = cosine_similarity(query_embedding, assessment_embeddings)[0]
+    
+    # Get top indices
+    top_indices = np.argsort(similarities)[::-1][:max_results]
+    
+    # Get recommendations
+    recommendations = [Assessment(**ASSESSMENTS[i]) for i in top_indices if similarities[i] > 0.3]
+    
+    # Generate explanation using Gemini
+    prompt = f"""Given the query: "{query}"
+    I recommended these assessments: {[rec.name for rec in recommendations]}
+    Please provide a brief explanation (2-3 sentences) of why these assessments are relevant."""
+    
     try:
-        # Get encoder and embeddings
-        encoder = get_encoder()
-        assessment_embeddings = get_assessment_embeddings()
-        
-        # Generate query embedding efficiently
-        query_embedding = encoder.encode([query], convert_to_numpy=True, show_progress_bar=False)
-        
-        # Calculate similarities using preallocated array
-        similarities = compute_similarities(query_embedding, assessment_embeddings)
-        
-        # Get top indices efficiently using partition
-        top_k = min(max_results, len(ASSESSMENTS))
-        top_indices = np.argpartition(similarities, -top_k)[-top_k:]
-        top_indices = top_indices[np.argsort(similarities[top_indices])][::-1]
-        
-        # Filter recommendations efficiently
-        recommendations = []
-        for idx in top_indices:
-            if similarities[idx] > 0.3:
-                recommendations.append(Assessment(**ASSESSMENTS[idx]))
-            else:
-                break
-        
-        # Generate explanation using Gemini
-        if recommendations:
-            prompt = f"""Given the query: "{query}"
-            I recommended these assessments: {[rec.name for rec in recommendations]}
-            Please provide a brief explanation (2-3 sentences) of why these assessments are relevant."""
-            
-            try:
-                response = model.generate_content(prompt)
-                explanation = response.text
-            except Exception as e:
-                explanation = f"Unable to generate explanation: {str(e)}"
-        else:
-            explanation = "No relevant assessments found matching your criteria."
-        
-        # Clean up memory
-        gc.collect()
-        
-        return RecommendationResponse(recommendations=recommendations, explanation=explanation)
+        response = model.generate_content(prompt)
+        explanation = response.text
     except Exception as e:
-        # Clean up on error
-        gc.collect()
-        raise e
+        explanation = f"Unable to generate explanation: {str(e)}"
+    
+    return RecommendationResponse(recommendations=recommendations, explanation=explanation)
 
 @app.get("/api/recommend", response_model=RecommendationResponse)
 async def recommend(
@@ -717,13 +671,4 @@ async def recommend_from_url(
     max_results: int = Query(10, ge=1, le=10)
 ):
     # In production, this would fetch and parse the URL content
-    raise HTTPException(status_code=501, detail="URL processing not implemented yet")
-
-# Cleanup on shutdown
-@app.on_event("shutdown")
-async def cleanup():
-    global _encoder, _assessment_embeddings, _similarity_matrix
-    _encoder = None
-    _assessment_embeddings = None
-    _similarity_matrix = None
-    gc.collect() 
+    raise HTTPException(status_code=501, detail="URL processing not implemented yet") 
