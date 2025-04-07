@@ -7,7 +7,6 @@ import os
 from dotenv import load_dotenv
 import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import pandas as pd
 
@@ -36,8 +35,8 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Initialize sentence transformer
-encoder = SentenceTransformer('all-MiniLM-L6-v2')
+# Initialize sentence transformer with efficient settings
+encoder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
 
 # Load and prepare assessment data
 class Assessment(BaseModel):
@@ -611,36 +610,51 @@ ASSESSMENTS = [
     }
 ]
 
-# Create embeddings for assessments
-assessment_embeddings = encoder.encode([f"{a['name']} {a['description']} {a['test_type']}" for a in ASSESSMENTS])
+# Create embeddings for assessments once at startup
+# Use numpy arrays directly for better memory efficiency
+assessment_texts = [f"{a['name']} {a['description']} {a['test_type']}" for a in ASSESSMENTS]
+assessment_embeddings = np.asarray(encoder.encode(assessment_texts, convert_to_numpy=True), dtype=np.float32)
+
+# Normalize embeddings once to avoid repeated normalization
+assessment_embeddings_normalized = assessment_embeddings / np.linalg.norm(assessment_embeddings, axis=1, keepdims=True)
 
 class RecommendationResponse(BaseModel):
     recommendations: List[Assessment]
     explanation: str
 
 def get_recommendations(query: str, max_results: int = 10) -> RecommendationResponse:
-    # Generate query embedding
-    query_embedding = encoder.encode([query])
+    # Generate query embedding efficiently
+    query_embedding = np.asarray(encoder.encode([query], convert_to_numpy=True), dtype=np.float32)
+    query_embedding_normalized = query_embedding / np.linalg.norm(query_embedding)
     
-    # Calculate similarities
-    similarities = cosine_similarity(query_embedding, assessment_embeddings)[0]
+    # Calculate cosine similarities using optimized dot product
+    similarities = np.dot(query_embedding_normalized, assessment_embeddings_normalized.T)[0]
     
-    # Get top indices
-    top_indices = np.argsort(similarities)[::-1][:max_results]
+    # Get top indices efficiently using partition
+    top_k = min(max_results, len(ASSESSMENTS))
+    top_indices = np.argpartition(-similarities, top_k)[:top_k]
+    top_indices = top_indices[np.argsort(-similarities[top_indices])]
     
-    # Get recommendations
-    recommendations = [Assessment(**ASSESSMENTS[i]) for i in top_indices if similarities[i] > 0.3]
+    # Get recommendations above threshold
+    recommendations = [
+        Assessment(**ASSESSMENTS[i]) 
+        for i in top_indices 
+        if similarities[i] > 0.3
+    ]
     
     # Generate explanation using Gemini
-    prompt = f"""Given the query: "{query}"
-    I recommended these assessments: {[rec.name for rec in recommendations]}
-    Please provide a brief explanation (2-3 sentences) of why these assessments are relevant."""
-    
-    try:
-        response = model.generate_content(prompt)
-        explanation = response.text
-    except Exception as e:
-        explanation = f"Unable to generate explanation: {str(e)}"
+    if recommendations:
+        prompt = f"""Given the query: "{query}"
+        I recommended these assessments: {[rec.name for rec in recommendations]}
+        Please provide a brief explanation (2-3 sentences) of why these assessments are relevant."""
+        
+        try:
+            response = model.generate_content(prompt)
+            explanation = response.text
+        except Exception as e:
+            explanation = f"Unable to generate explanation: {str(e)}"
+    else:
+        explanation = "No relevant assessments found matching your criteria."
     
     return RecommendationResponse(recommendations=recommendations, explanation=explanation)
 
