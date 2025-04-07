@@ -17,13 +17,18 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI(title="SHL Assessment Recommendation System")
 
-# Add CORS middleware
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=[
+        "https://shl-recommendation.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:5000"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    max_age=86400  # 24 hours
 )
 
 # Initialize Gemini
