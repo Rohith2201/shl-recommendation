@@ -3,7 +3,7 @@ services:
     name: shl-assessment-api
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: cd app && uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: cd app && uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --limit-concurrency 20
     envVars:
       - key: PYTHON_VERSION
         value: 3.8.0
@@ -11,13 +11,14 @@ services:
         sync: false
       - key: PORT
         value: 10000
+      - key: MALLOC_ARENA_MAX
+        value: 2
+      - key: PYTHONUNBUFFERED
+        value: 1
     autoDeploy: true
     healthCheckPath: /
-    plan: starter # Specifies the free tier
+    plan: starter
     scaling:
       minInstances: 1
       maxInstances: 1
-      targetMemoryPercent: 80
-    resources:
-      cpu: 0.25
-      memory: 512Mi 
+      targetMemoryPercent: 75 

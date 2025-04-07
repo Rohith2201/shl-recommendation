@@ -6,8 +6,7 @@ import json
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+import gc
 import numpy as np
 import pandas as pd
 
@@ -36,8 +35,15 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Initialize sentence transformer
-encoder = SentenceTransformer('all-MiniLM-L6-v2')
+# Lazy loading of heavy models
+_encoder = None
+
+def get_encoder():
+    global _encoder
+    if _encoder is None:
+        from sentence_transformers import SentenceTransformer
+        _encoder = SentenceTransformer('all-MiniLM-L6-v2')
+    return _encoder
 
 # Load and prepare assessment data
 class Assessment(BaseModel):
@@ -611,38 +617,58 @@ ASSESSMENTS = [
     }
 ]
 
-# Create embeddings for assessments
-assessment_embeddings = encoder.encode([f"{a['name']} {a['description']} {a['test_type']}" for a in ASSESSMENTS])
+# Create embeddings lazily
+_assessment_embeddings = None
+
+def get_assessment_embeddings():
+    global _assessment_embeddings
+    if _assessment_embeddings is None:
+        encoder = get_encoder()
+        _assessment_embeddings = encoder.encode([f"{a['name']} {a['description']} {a['test_type']}" for a in ASSESSMENTS])
+    return _assessment_embeddings
 
 class RecommendationResponse(BaseModel):
     recommendations: List[Assessment]
     explanation: str
 
 def get_recommendations(query: str, max_results: int = 10) -> RecommendationResponse:
-    # Generate query embedding
-    query_embedding = encoder.encode([query])
-    
-    # Calculate similarities
-    similarities = cosine_similarity(query_embedding, assessment_embeddings)[0]
-    
-    # Get top indices
-    top_indices = np.argsort(similarities)[::-1][:max_results]
-    
-    # Get recommendations
-    recommendations = [Assessment(**ASSESSMENTS[i]) for i in top_indices if similarities[i] > 0.3]
-    
-    # Generate explanation using Gemini
-    prompt = f"""Given the query: "{query}"
-    I recommended these assessments: {[rec.name for rec in recommendations]}
-    Please provide a brief explanation (2-3 sentences) of why these assessments are relevant."""
-    
     try:
-        response = model.generate_content(prompt)
-        explanation = response.text
+        # Generate query embedding
+        encoder = get_encoder()
+        query_embedding = encoder.encode([query])
+        
+        # Get pre-computed assessment embeddings
+        assessment_embeddings = get_assessment_embeddings()
+        
+        # Calculate similarities
+        from sklearn.metrics.pairwise import cosine_similarity
+        similarities = cosine_similarity(query_embedding, assessment_embeddings)[0]
+        
+        # Get top indices
+        top_indices = np.argsort(similarities)[::-1][:max_results]
+        
+        # Get recommendations
+        recommendations = [Assessment(**ASSESSMENTS[i]) for i in top_indices if similarities[i] > 0.3]
+        
+        # Generate explanation using Gemini
+        prompt = f"""Given the query: "{query}"
+        I recommended these assessments: {[rec.name for rec in recommendations]}
+        Please provide a brief explanation (2-3 sentences) of why these assessments are relevant."""
+        
+        try:
+            response = model.generate_content(prompt)
+            explanation = response.text
+        except Exception as e:
+            explanation = f"Unable to generate explanation: {str(e)}"
+        
+        # Clean up memory
+        gc.collect()
+        
+        return RecommendationResponse(recommendations=recommendations, explanation=explanation)
     except Exception as e:
-        explanation = f"Unable to generate explanation: {str(e)}"
-    
-    return RecommendationResponse(recommendations=recommendations, explanation=explanation)
+        # Clean up memory on error
+        gc.collect()
+        raise e
 
 @app.get("/api/recommend", response_model=RecommendationResponse)
 async def recommend(
@@ -671,4 +697,12 @@ async def recommend_from_url(
     max_results: int = Query(10, ge=1, le=10)
 ):
     # In production, this would fetch and parse the URL content
-    raise HTTPException(status_code=501, detail="URL processing not implemented yet") 
+    raise HTTPException(status_code=501, detail="URL processing not implemented yet")
+
+# Cleanup on shutdown
+@app.on_event("shutdown")
+async def cleanup():
+    global _encoder, _assessment_embeddings
+    _encoder = None
+    _assessment_embeddings = None
+    gc.collect() 
